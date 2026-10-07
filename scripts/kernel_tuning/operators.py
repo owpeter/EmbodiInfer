@@ -4,10 +4,9 @@ Each entry states only what a person must decide: the mathematical reference, th
 production kernel call used as the baseline, model-derived workload shapes, and
 the numerical contract. ``generate.py`` turns an entry into a complete KDA task.
 
-The ``workloads`` here are estimates from model configurations. Shapes captured
-from real runs (``benchmarks/kernel_tuning/captures/*.jsonl``, see
-``capture.py``) replace them by default; the estimates remain the fallback for
-operators no capture covers.
+The entries remain internal task-generation and baseline-test fixtures. Model
+discovery uses the complete inference observer and does not select operators or
+workloads from this catalog.
 """
 
 from __future__ import annotations

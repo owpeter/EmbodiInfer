@@ -65,6 +65,26 @@ def test_default_randn_records_real_state_and_generates_a_task(tmp_path: Path) -
     assert torch.equal(torch.get_rng_state(), after)
 
 
+@pytest.mark.parametrize("replacement", [False, True])
+def test_multinomial_replays_real_probabilities_and_rng_state(tmp_path: Path, replacement: bool) -> None:
+    weights = torch.tensor([[0.0, 0.2, 0.8], [0.7, 0.0, 0.3]])
+    before = torch.get_rng_state().clone()
+    observed = []
+    capture = record(
+        tmp_path, lambda: observed.append(torch.multinomial(weights, 2, replacement=replacement))
+    )
+    after = torch.get_rng_state().clone()
+    capture.require_ready()
+    (task,) = render_model(capture, tmp_path / "tasks")
+    (case,) = read_json(task.root / "replay.json")["cases"].values()
+    assert case["inputs"][0]["fixture"]
+    inputs = materialize(case["inputs"], task.root, 0)
+    assert torch.equal(inputs[0], weights)
+    torch.set_rng_state(before)
+    assert torch.equal(baseline(task)(*inputs), observed[0])
+    assert torch.equal(torch.get_rng_state(), after)
+
+
 def test_float64_task_preserves_dtype_and_values(tmp_path: Path) -> None:
     value = torch.tensor([1.0 + 2**-30, 1.0 - 2**-30], dtype=torch.float64)
     capture = record(tmp_path, value.sin)
@@ -106,10 +126,23 @@ def test_unsupported_rng_and_explicit_generators_still_block(tmp_path: Path) -> 
     for name, fn in (
         ("explicit", lambda: torch.randn(2, generator=torch.Generator().manual_seed(7))),
         ("uniform", lambda: torch.rand(2)),
+        ("categorical_explicit", lambda: torch.multinomial(torch.ones(3), 1, generator=torch.Generator())),
     ):
         capture = record(tmp_path / name, fn)
         with pytest.raises(ContractError, match="incomplete"):
             capture.require_ready()
+
+
+def test_public_sdpa_lowering_with_zero_dropout_does_not_block_inference(tmp_path: Path) -> None:
+    q = torch.randn(1, 2, 8, 16)
+    before = torch.get_rng_state().clone()
+    actual = []
+    capture = record(
+        tmp_path, lambda: actual.append(torch.nn.functional.scaled_dot_product_attention(q, q, q))
+    )
+    capture.require_ready()
+    assert torch.equal(torch.get_rng_state(), before)
+    assert torch.equal(actual[0], torch.nn.functional.scaled_dot_product_attention(q, q, q))
 
 
 @pytest.mark.parametrize("style", ["omitted", "positional", "keyword"])

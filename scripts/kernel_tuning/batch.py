@@ -92,7 +92,7 @@ def preflight(root: Path, names: list[str] | None = None) -> dict[str, str | Non
     _verify_model(root, batch)
     if batch.get("model"):
         if names is not None:
-            raise ContractError("Model preflight must include every discovered task")
+            raise ContractError("Model preflight must include every task in the recorded scope")
         batch["preflight_complete"] = False
         atomic_json(root / "batch.json", batch)
     results: dict[str, str | None] = {}
@@ -147,25 +147,38 @@ def preflight(root: Path, names: list[str] | None = None) -> dict[str, str | Non
 
 
 def create_model(
-    capture: ModelCapture, output: Path, *, agent: str, overrides: dict[str, Any], hardware_notes: Path | None
+    capture: ModelCapture,
+    output: Path,
+    *,
+    agent: str,
+    overrides: dict[str, Any],
+    hardware_notes: Path | None,
+    selection: dict[str, list[str] | None] | None = None,
 ) -> Path:
-    """Freeze one model capture and all tasks in a batch requiring a complete preflight."""
-    from .discovery.tasks import render_model
+    """Freeze the full capture and every selected task, requiring all of their preflights.
 
-    capture.require_ready()
+    Omit ``selection`` for complete-model coverage; otherwise map captured operator
+    IDs to workload ID lists, or null to include all workloads of an operator.
+    """
+    from .discovery.tasks import normalize_selection, render_model
+
+    # Verify before copying, then verify the copy, to reject a stale capture.
+    checked = ModelCapture.load(capture.root, capture.manifest["target"]["model"], require_ready=False)
+    if checked.identity != capture.identity:
+        raise ContractError("Capture changed before batch creation")
+    capture = checked
+    selection = normalize_selection(capture, selection)
     root = output.resolve() / (
         datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + f"-{uuid4().hex[:8]}-model"
     )
     root.mkdir(parents=True, exist_ok=False)
-    # Verify before copying, then verify the copy, to reject a stale capture.
-    checked = ModelCapture.load(capture.root, capture.manifest["target"]["model"])
-    if checked.identity != capture.identity:
-        raise ContractError("Capture changed before batch creation")
     shutil.copytree(capture.root, root / "capture")
-    frozen = ModelCapture.load(root / "capture", capture.manifest["target"]["model"])
+    frozen = ModelCapture.load(root / "capture", capture.manifest["target"]["model"], require_ready=False)
     if frozen.identity != capture.identity:
         raise ContractError("Capture changed during batch creation")
-    tasks = render_model(frozen, root / "tasks", overrides=overrides, hardware_notes=hardware_notes)
+    tasks = render_model(
+        frozen, root / "tasks", overrides=overrides, hardware_notes=hardware_notes, selection=selection
+    )
     names = {op["id"]: op["name"] for op in capture.operators}
     items = {
         task.root.name: {
@@ -189,6 +202,7 @@ def create_model(
             "overrides": overrides,
             "model": capture.manifest["target"],
             "capture_identity": capture.identity,
+            "selection": selection,
             "preflight_complete": False,
             "items": items,
         },
@@ -197,18 +211,29 @@ def create_model(
 
 
 def _verify_model(root: Path, batch: dict[str, Any], *, require_preflight: bool = False) -> None:
+    from .discovery.tasks import normalize_selection, selected_numerics
+
     if batch.get("schema_version") != 2:
         if batch.get("model") or (root / "tasks/model.json").exists():
             raise ContractError("Unsupported model batch schema")
         return
-    capture = ModelCapture.load(root / "capture", batch["model"]["model"])
+    capture = ModelCapture.load(root / "capture", batch["model"]["model"], require_ready=False)
     if capture.identity != batch["capture_identity"] or capture.manifest["target"] != batch["model"]:
         raise ContractError("Batch target/capture identity changed")
-    expected = {op["id"] for op in capture.operators if op["status"] == "ready"}
+    selection = normalize_selection(capture, batch.get("selection"))
+    if selection != batch.get("selection"):
+        raise ContractError("Model batch selection changed from its normalized scope")
+    operators = {op["id"]: op for op in capture.operators if op["status"] == "ready"}
+    expected = set(selection) if selection is not None else set(operators)
     if set(batch["items"]) != expected:
         raise ContractError("Model batch has task coverage gaps")
     index = read_json(root / "tasks/model.json")
-    if index["capture_identity"] != capture.identity or set(index["tasks"]) != expected:
+    if (
+        index["capture_identity"] != capture.identity
+        or index.get("target") != batch["model"]
+        or index.get("selection") != selection
+        or set(index["tasks"]) != expected
+    ):
         raise ContractError("Generated task index differs from the model capture")
     for name, item in batch["items"].items():
         if item["task"] != f"tasks/{name}":
@@ -219,6 +244,44 @@ def _verify_model(root: Path, batch: dict[str, Any], *, require_preflight: bool 
         replay = read_json(task.root / "replay.json")
         if replay["capture_identity"] != capture.identity or replay["target"] != batch["model"]:
             raise ContractError("Task belongs to a different target model")
+        op = operators[name]
+        expected_cases = {
+            case["id"]: case for case in op["workloads"] if selection is None or case["id"] in selection[name]
+        }
+        generated = read_json(task.root / "generated.json")
+        if (
+            generated.get("operator_id") != name
+            or generated.get("coverage_scope", "full_model")
+            != ("selected" if selection is not None else "full_model")
+            or generated.get("selection_digest") != (digest(selection) if selection is not None else None)
+            or set(task.workload_ids) != set(expected_cases)
+            or replay["cases"] != expected_cases
+            or replay["operator"] != op["name"]
+            or replay["mutates"] != op["identity"]["mutates"]
+            or replay.get("rng") != op["identity"].get("rng")
+            or replay["flags"] != capture.manifest["flags"]
+        ):
+            raise ContractError("Model task workload evidence or selected scope changed")
+        fixture_paths = {
+            spec["fixture"]
+            for case in expected_cases.values()
+            for spec in case["inputs"]
+            if "fixture" in spec
+        } | {
+            path
+            for case in expected_cases.values()
+            for phase in case.get("rng", {}).values()
+            for path in phase.values()
+        }
+        if any(task.hashes[path] != capture.manifest["files"][path] for path in fixture_paths):
+            raise ContractError("Model task fixtures changed from the capture")
+        numerical = selected_numerics(capture, op, list(expected_cases))
+        if numerical is not None and (
+            replay.get("numerical_identity") != op["identity"]
+            or "numerics.json" not in task.hashes
+            or read_json(task.root / "numerics.json") != numerical
+        ):
+            raise ContractError("Model task numerical evidence changed from the capture")
     if require_preflight and (
         not batch.get("preflight_complete")
         or not all(item.get("preflight_passed") for item in batch["items"].values())
@@ -373,9 +436,16 @@ def write_summary(root: Path) -> list[dict[str, Any]]:
     ]
     if batch.get("model"):
         coverage = read_json(root / "capture/coverage.json")["operators"]
+        scope = (
+            f"Selected scope: {len(batch['selection'])} operators, "
+            f"{sum(len(ids) for ids in batch['selection'].values())} workloads; not full-model coverage."
+            if batch.get("selection") is not None
+            else "Scope: every eligible captured operator and workload."
+        )
         lines[2:2] = [
             f"Model: `{batch['model']['model']}`. Capture: `{batch['capture_identity']}`.",
-            f"Coverage: `{coverage}`. All-baseline preflight passed: `{batch['preflight_complete']}`.",
+            scope,
+            f"Capture inventory: `{coverage}`. All scoped baselines passed: `{batch['preflight_complete']}`.",
             "",
         ]
     for row in rows:

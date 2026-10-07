@@ -68,30 +68,49 @@ uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning --help
 uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning check benchmarks/kernel_tuning/tasks/gated_residual
 ```
 
-To tune one model, capture its existing preparation forward and calibrate numerical
-contracts in its model runtime, then generate and preflight every eligible call
+To tune one model, supply its policy/engine settings and a real serialized
+Observation batch. The tooling runs one complete synchronous inference in its
+model runtime, calibrates numerical contracts, then generates and preflights every eligible call
 (see [model discovery](docs/proposals/0008-kernel-tuning.md#model-scoped-operator-discovery)):
 
 ```bash
-/absolute/runtime/python -m scripts.kernel_tuning capture --model pi05 --fixture-bytes 8589934592 --output results/kernel_tuning/captures/pi05 -- /absolute/preparation.py
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning tune-all --model pi05 --inference-config inference.json --fixture-bytes 8589934592 --agent 'HARNESS/MODEL:EFFORT' --set evaluator_python=/absolute/runtime/python
+```
+
+The linked proposal defines `inference.json` and the tensor archive. Observation
+collation, preprocessing, prefix encoding, the full decoder, and output conversion
+are observed together; no benchmark or preparation script is needed. Recurrent
+observations use explicit fresh sessions. Loading happens before observation.
+This mode covers the executed input/configuration and requires all its eligible
+operators; it rejects `--selection` and `--skip-preflight`. With
+`--inference-config`, `--dry-run` executes inference and calibration but starts no
+preflight or coding agents. Captures and returned actions remain available for
+inspection; missing replay contracts or failed inference prevent tuning.
+
+The same inference capture can be processed in separate steps:
+
+```bash
+/absolute/runtime/python -m scripts.kernel_tuning capture --model pi05 --inference-config inference.json --fixture-bytes 8589934592 --output results/kernel_tuning/captures/pi05
 uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning generate --model pi05 --captured results/kernel_tuning/captures/pi05 --list
 /absolute/runtime/python -m scripts.kernel_tuning calibrate --captured results/kernel_tuning/captures/pi05 --output results/kernel_tuning/captures/pi05-calibrated
 uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning tune-all --model pi05 --captured results/kernel_tuning/captures/pi05-calibrated --agent 'HARNESS/MODEL:EFFORT' --set evaluator_python=/absolute/runtime/python
 uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning tune-all --resume results/kernel_tuning/batches/BATCH_ID
 ```
 
-`/absolute/preparation.py` is your existing preparation driver, constructing the
-selected canonical policy through `make_policy` and running its normal forward
-path. Disable compilation explicitly; select the same checkpoint, backend,
-dtype, batching and decoding settings that will be tuned. Discovery covers only
-paths exercised by that preparation. The capture records ATen overloads and
-existing backend entrypoints, all observed shapes/layouts, and call counts.
+Capture requires `--model` and `--inference-config`; external-script arguments,
+method-scoped capture, catalog selection and estimated-shape fallback have been
+removed. Select the same checkpoint, backend, dtype, batching and decoding settings
+that will be tuned. Discovery covers the paths exercised by that inference. The
+capture records ATen overloads and existing backend entrypoints, all observed
+shapes/layouts, and call counts.
 Quantized calls and their internals are excluded; views/allocations and host work
 are listed separately. No new fusion is introduced. A missing replay contract,
 required fixture, or failing baseline blocks the entire model batch. `--dry-run`
 only builds tasks; `--preflight-only` measures baselines without opening agents.
-Model batches cannot use `--skip-preflight`, partial operator selection, or
-estimated shapes. A standalone `run` cannot bypass their preflight barrier.
+Model batches cannot use `--skip-preflight` or estimated shapes. Existing captures
+can use an explicit `--selection` file to freeze a narrower operator/workload
+scope; the direct inference workflow always uses every eligible recorded call.
+A standalone `run` cannot bypass their preflight barrier.
 
 The default fixture budget is 64 MiB; the example raises the upper limit to 8 GiB
 without allocating it up front. Supported floating matmul/linear, reductions,
@@ -106,17 +125,16 @@ Calibration costs extra storage and target-device compute, before any agent runs
 Use a new capture/calibration/batch when changing settings. Old runs keep their
 original contract; old captures with incomplete real inputs need recapture.
 
-Default-generator `randn` tasks save required before/after RNG fixtures, check
+Default-generator `randn` and `multinomial` tasks save required before/after RNG fixtures, check
 both output bytes and generator advancement, and support eager timing only.
+Categorical sampling also retains its real probability inputs for valid replay.
 Explicit generators and other unsupported RNG calls remain coverage gaps.
 SDPA with zero/default dropout is eligible; nonzero dropout still needs an adapter.
 Discovered float64 tensors use the opt-in replay definition schema and retain
 double precision through task generation and evaluation.
 
-The old catalog workflow remains available explicitly with `generate --catalog`,
-`tune-all --catalog`, and `capture --catalog`. Only that workflow accepts legacy
-JSONL captures, catalog model groups, operator subsets and `--estimated`; it
-does not certify model coverage. Existing JSONL must be recaptured for model tuning.
+Existing catalog JSONL files are historical baseline-test data and cannot be
+used for model tuning. Recapture with `capture --inference-config` to migrate.
 
 Run these commands from the repository root. Humanize2 is pinned to a reviewed
 source revision in the tool's `pyproject.toml`; it drives an existing, separately

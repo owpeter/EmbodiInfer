@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..artifacts import REPOSITORY, atomic_json
-from ..contracts import ContractError, TaskPackage, read_json
+from ..contracts import ContractError, TaskPackage, digest, read_json
 from ..generate import _dump_yaml, tuning_settings, vendor_sources
 from ..operators import Operator, Workload
 from .contracts import REPLAY_SCHEMA, ModelCapture
@@ -30,6 +30,74 @@ _DTYPES = {
     "int8",
     "bool",
 }
+
+
+def normalize_selection(
+    capture: ModelCapture, selection: dict[str, list[str] | None] | None
+) -> dict[str, list[str]] | None:
+    """Validate an explicit scope and order its IDs as recorded in the full capture.
+
+    ``None`` retains complete-model coverage. An explicit nonempty mapping selects
+    ready operator IDs; a null value includes all workloads of that operator.
+    Unselected preparation gaps remain in the capture but do not block this scope.
+    """
+    if selection is None:
+        capture.require_ready()
+        return None
+    if not capture.manifest.get("complete") or capture.manifest.get("errors"):
+        raise ContractError("Selected tuning requires a completed, error-free model capture")
+    if not isinstance(selection, dict) or not selection:
+        raise ContractError("Selection must be a nonempty mapping of operator IDs to workload IDs or null")
+    operators = {op["id"]: op for op in capture.operators}
+    if unknown := selection.keys() - operators.keys():
+        raise ContractError(f"Unknown selected operator IDs: {sorted(unknown, key=str)}")
+    normalized = {}
+    for op_id, op in operators.items():
+        if op_id not in selection:
+            continue
+        if op["status"] != "ready":
+            raise ContractError(f"Selected operator is not ready: {op_id} ({op['status']})")
+        available = [case["id"] for case in op["workloads"]]
+        selected = selection[op_id]
+        if selected is None:
+            selected = available
+        if (
+            not isinstance(selected, list)
+            or not selected
+            or any(not isinstance(key, str) for key in selected)
+            or len(set(selected)) != len(selected)
+        ):
+            raise ContractError(f"Selected workloads must be a nonempty list of distinct IDs: {op_id}")
+        if unknown := set(selected) - set(available):
+            raise ContractError(f"Unknown selected workload IDs for {op_id}: {sorted(unknown)}")
+        normalized[op_id] = [key for key in available if key in selected]
+    return normalized
+
+
+def selected_numerics(
+    capture: ModelCapture, op: dict[str, Any], workload_ids: list[str]
+) -> dict[str, Any] | None:
+    """Subset frozen calibration after validating its complete original workload evidence."""
+    if policy(op["identity"]) is None:
+        return None
+    path = capture.root / "calibration.json"
+    numerical = read_json(path).get(op["id"]) if path.is_file() else None
+    if numerical is None:
+        raise ContractError(
+            "Missing numerical calibration; run calibrate --captured CAPTURE --output NEW_CAPTURE in the model environment"
+        )
+    validate_contract(
+        numerical,
+        op["identity"],
+        {case["id"]: case for case in op["workloads"]},
+        capture.manifest["precision"],
+        capture.manifest["flags"],
+    )
+    return {
+        **numerical,
+        "workloads": {key: numerical["workloads"][key] for key in workload_ids},
+        "cases": {key: numerical["cases"][key] for key in workload_ids},
+    }
 
 
 def _expression(recipe: dict[str, Any]) -> str:
@@ -104,8 +172,18 @@ def _sources(op: dict[str, Any]) -> tuple[str, dict[str, str]]:
 
 
 def _plan(
-    capture: ModelCapture, op: dict[str, Any], overrides: dict[str, Any], hardware_notes: Path | None
+    capture: ModelCapture,
+    op: dict[str, Any],
+    overrides: dict[str, Any],
+    hardware_notes: Path | None,
+    workload_ids: list[str] | None = None,
+    selection_digest: str | None = None,
 ) -> dict[str, str | bytes]:
+    numerical = selected_numerics(
+        capture, op, workload_ids if workload_ids is not None else [case["id"] for case in op["workloads"]]
+    )
+    if workload_ids is not None:
+        op = {**op, "workloads": [case for case in op["workloads"] if case["id"] in workload_ids]}
     name = "discovered_" + op["id"]
     unsupported = {
         spec["dtype"] for case in op["workloads"] for spec in case["inputs"] + case["outputs"]
@@ -165,15 +243,8 @@ def _plan(
         for phase in case.get("rng", {}).values():
             for path in phase.values():
                 sources[path] = (capture.root / path).read_bytes()
-    numerical = None
     precision = {"mode": "bit_exact", **execution_precision(capture.manifest["precision"])}
-    if policy(identity) is not None:
-        path = capture.root / "calibration.json"
-        numerical = read_json(path).get(op["id"]) if path.is_file() else None
-        if numerical is None:
-            raise ContractError(
-                "Missing numerical calibration; run calibrate --captured CAPTURE --output NEW_CAPTURE in the model environment"
-            )
+    if numerical is not None:
         validate_contract(
             numerical, identity, cases, capture.manifest["precision"], capture.manifest["flags"]
         )
@@ -246,6 +317,8 @@ def _plan(
                     "generator": "scripts.kernel_tuning.discovery",
                     "capture_identity": capture.identity,
                     "operator_id": op["id"],
+                    "coverage_scope": "selected" if workload_ids is not None else "full_model",
+                    "selection_digest": selection_digest,
                 }
             ),
         }
@@ -284,23 +357,36 @@ def render_model(
     *,
     overrides: dict[str, Any] | None = None,
     hardware_notes: Path | None = None,
+    selection: dict[str, list[str] | None] | None = None,
 ) -> list[TaskPackage]:
-    """Build all eligible tasks or reject the entire model before writing any task."""
-    capture.require_ready()
+    """Build every task in the declared scope, or reject before writing any task.
+
+    ``selection`` maps captured operator IDs to nonempty workload ID lists, or
+    null for all workloads of that operator. Omission requires full-model coverage.
+    """
     # Recheck snapshots immediately before construction; do not trust a previously loaded object.
-    checked = ModelCapture.load(capture.root, capture.manifest["target"]["model"])
+    checked = ModelCapture.load(capture.root, capture.manifest["target"]["model"], require_ready=False)
     if checked.identity != capture.identity:
         raise ContractError("Capture changed before task generation")
+    capture = checked
+    selection = normalize_selection(capture, selection)
     destination = destination.resolve()
     if destination.exists() and any(destination.iterdir()):
         raise ContractError("Model tasks require a new or empty destination")
     plans = {}
     failures = []
     for op in capture.operators:
-        if op["status"] != "ready":
+        if op["status"] != "ready" or (selection is not None and op["id"] not in selection):
             continue
         try:
-            plans[op["id"]] = _plan(capture, op, overrides or {}, hardware_notes)
+            plans[op["id"]] = _plan(
+                capture,
+                op,
+                overrides or {},
+                hardware_notes,
+                selection[op["id"]] if selection else None,
+                digest(selection) if selection is not None else None,
+            )
         except (ContractError, KeyError, ValueError) as exc:
             failures.append(f"{op['name']}: {exc}")
     if failures:
@@ -321,6 +407,7 @@ def render_model(
         {
             "capture_identity": capture.identity,
             "target": capture.manifest["target"],
+            "selection": selection,
             "tasks": {task.root.name: task.identity for task in tasks},
         },
     )

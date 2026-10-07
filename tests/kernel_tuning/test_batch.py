@@ -174,36 +174,12 @@ def test_failed_preflight_skips_the_operator(tmp_path: Path, monkeypatch) -> Non
 
 def test_cli_validates_agent_and_resume_arguments(tmp_path: Path, capsys) -> None:
     output = tmp_path / "batches"
-    assert main(["tune-all", "rms_norm", "--output", str(output)]) == 2
+    assert main(["tune-all", "--model", "mock_flow_vla", "--output", str(output)]) == 2
     assert "explicit Humanize2 agent" in capsys.readouterr().err
     assert not output.exists()
-    assert main(["tune-all", "--catalog", "--model", "streamvln", "--dry-run", "--output", str(output)]) == 0
-    (root,) = output.iterdir()
-    assert set(read_json(root / "batch.json")["items"]) == {"rms_norm", "add_rms_norm", "swiglu"}
-    assert "| swiglu | pending |" in capsys.readouterr().out
+    root = new_batch(tmp_path, ["rms_norm"])
     assert main(["tune-all", "--resume", str(root), "--set", "device=cuda:1"]) == 2
     assert "--resume continues the recorded batch" in capsys.readouterr().err
-
-
-def test_cli_generate_writes_overridden_tasks(tmp_path: Path, capsys) -> None:
-    notes = tmp_path / "thor.md"
-    notes.write_text("Jetson Thor: sm_110, 128 GB unified memory.\n", encoding="utf-8")
-    argv = [
-        "generate",
-        "--catalog",
-        "rms_norm",
-        "--output",
-        str(tmp_path / "tasks"),
-        "--hardware-notes",
-        str(notes),
-    ]
-    assert main([*argv, "--set", "evaluator_python=/opt/runtime/bin/python"]) == 0
-    task = TaskPackage.load(tmp_path / "tasks/rms_norm")
-    assert task.settings.evaluator_python == "/opt/runtime/bin/python"
-    assert "HARDWARE.md" in task.hashes
-    assert "HARDWARE.md" in (task.root / "README.md").read_text(encoding="utf-8")
-    assert main(argv) == 2
-    assert "--force" in capsys.readouterr().err
 
 
 def test_variable_axes_must_be_inferable_from_inputs(tmp_path: Path) -> None:

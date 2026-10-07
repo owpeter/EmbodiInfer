@@ -323,57 +323,60 @@ in the task. The new response's request digest reflects relocated paths. This
 executes evaluation, not agent search. Actual Thor compilation and performance
 are not established by CPU/fake-agent tests.
 
-### Generated catalog tasks and batch tuning
+### Generated tasks and batch tuning
 
-Hand-writing a task package per operator does not scale to every core kernel.
-`scripts/kernel_tuning/operators.py` declares each core Triton operator once:
-its eager Torch reference, the production call used as the baseline, the
-model-derived workload shapes, and the numerical contract. `generate --catalog` renders a
-complete task package from an entry. The baseline is the production kernel
-itself: the defining repository module and the repository modules it imports
-are copied byte-for-byte under `vendor/` (absolute `embodiinfer.` imports are
-rewritten to relative ones; package `__init__` files are never copied), and
-`baseline.py` calls it as the engine does. `generated.json` records the
-repository revision and source digests. Structured integer inputs such as
-segment offsets are written as safetensors data inside the task.
+Observed model operators render into self-contained task packages. Existing
+backend implementations and their repository-local import closure are copied
+under `vendor/`; absolute repository imports become relative ones. The frozen
+production implementation is the baseline. Source digests, replay inputs,
+numerical contracts and workload counts are retained in each task package.
+The hand-maintained entries in `operators.py` remain internal baseline-test
+fixtures; model discovery and CLI task selection do not use them.
 
-The catalog covers the Triton paths of pi0.5 (`ada_rms_norm`, `gated_residual`,
-`gated_gelu`, `rotate_qk`, `split_kv_attention`), the Qwen2.5-VL vision tower of
-the Qwen R2R low-level and panoramic policies (`rotate_half_rope`,
-`segmented_attention`), and StreamVLN's Qwen2 decode path (`rms_norm`,
-`add_rms_norm`, `swiglu`). ActiveVLN runs the Transformers vision tower and an
-eager attention backend, so it currently calls none of these kernels. Workloads
-come from committed captures (see below); the catalog's estimates are only the
-fallback (`--estimated`). All generated tasks time with CUDA Graphs.
-
-Contracts follow the production kernel, not an aspiration. `gated_residual`
-and `rotate_qk` are bit-exact against Torch. The other kernels already round
-differently from eager Torch, so their contract is a tolerance with a stated
-reason: `atol = 2**-10` and `rtol = k * 2**-8`, where `k` counts BF16 roundings
-the production kernel and the eager reference do not share (2 when only the
-final casts differ; 3 for `rms_norm` and `swiglu`; 4 for `gated_gelu` and
-`add_rms_norm`). The `gpu`-marked
-`test_production_baseline_meets_generated_contract` checks every production
-baseline against its contract, including changed-input CUDA Graph replay, and
-prints the fraction of the bound it uses. Every baseline passed on an RTX 4060
-Laptop GPU (Torch 2.6, Triton 3.2; at most 0.85 of its bound) and on an RTX
-5090 (Torch 2.12, Triton 3.7; at most 0.90), and the evaluator preflight passed
-for all ten tasks on both. Re-run both on each target before trusting a
-contract there.
-
-`tune-all --catalog` generates the selected operators into a new batch directory under
-`results/kernel_tuning/batches/`, measures every production baseline with the
-evaluator (preflight), and then runs each operator serially in its own
-`run`/`resume` subprocess. A failed operator does not stop the batch; an
-interrupt does, and `tune-all --resume BATCH` continues it, resuming existing
-run archives. Promoted kernels are exported to `exports/<operator>`, and
-`summary.md`/`summary.json` report attempts, promotions, and the improvement
-over the production baseline from the weakest paired round. Machine-specific
-settings (`evaluator_python`, `device`, budgets) are passed with `--set` at
-generation time, and `--hardware-notes` copies target-hardware notes into each
-task as `HARDWARE.md` for the agent.
+`tune-all` creates a new model batch, preflights every selected production
+baseline, and then runs each task serially in its own `run`/`resume` subprocess.
+A failed preflight prevents every agent in that model batch from starting.
+Promoted kernels export to `exports/<operator>`; summaries preserve attempts,
+promotions and measured improvement. `tune-all --resume BATCH` resumes an
+interrupted batch under its frozen capture/task contracts. Target settings are
+supplied with `--set` and hardware notes with `--hardware-notes`.
 
 ### Model-scoped operator discovery
+
+The primary model workflow runs one end-to-end inference itself. An inference
+configuration supplies policy builder kwargs, engine settings and a serialized
+observation batch. The driver constructs the selected policy and synchronous
+engine, then observes the entire public `GenerationBackend.generate` call:
+collation and model preprocessing, prefix encoding, all decoder steps, and final
+action conversion. It does not depend on a benchmark or a policy-method whitelist.
+Construction and input deserialization are outside the inference scope. Recurrent
+observations receive explicit fresh `SessionKey` values; their transactions remain
+owned by the engine. Internal CUDA Graph warmup/capture and replay stay in the
+observed call. There is one top-level generation call, not an extra reference
+forward. Only the executed input/configuration is covered, not every possible
+model branch or recurrent history.
+
+`tune-all --inference-config` launches capture and numerical calibration in the
+explicit `evaluator_python` runtime, then generates, preflights and tunes all
+eligible recorded calls. The tooling environment never imports the selected
+model's dependency stack. Its capture manifest records the end-to-end entry and
+successful call/output counts; `inference.json` freezes resolved settings and the
+input hash, and `actions.pt` retains returned actions. Inference failure prevents
+a complete capture. Unsupported operator contracts prevent tuning rather than
+silently reducing its scope. This mode does not accept operator selection or
+skipped preflight. With this input mode, `--dry-run` still runs inference and
+calibration, but starts no evaluator preflight or coding agents.
+
+This remains developer tooling: the driver uses model-neutral public engine and
+policy contracts without changing runtime APIs or adding model-name branches.
+Model-specific preprocessing stays in each policy. An alternative of extending
+the method-name hook list was rejected for this workflow: it would continue to
+miss computation between methods and require updates whenever models split their
+internal entrypoints. External-script capture, policy-method hooks, catalog CLI
+selection and estimated-shape fallback have been removed. Capture requires the
+inference configuration; old script/JSONL workflows must be recaptured through
+this entry. The built-in path is synchronous and does not claim observation of
+other threads/processes or opaque native calls.
 
 The model workflow selects exactly one canonical policy ID before preparation.
 During the existing preparation execution, a scoped ATen observer and wrappers
@@ -395,9 +398,18 @@ changing the model's attention or execution path. CUDA Graph metadata is collect
 during warmup/capture and calls are counted on replay. Bounded fixtures may be saved
 outside graph capture; cases requiring unavailable fixtures are coverage gaps.
 Unknown external operators, unrepresentable arguments/state, and unsupported
-contracts also remain explicit gaps. Every eligible workload must have a task and
-all production baselines must pass preflight before any model batch starts an
-agent. No partial-model or skip-preflight escape hatch is provided.
+contracts also remain explicit gaps. By default every eligible workload must have
+a task. An explicit `--selection` declares a smaller operator/workload scope while
+preserving the complete immutable capture and its coverage gaps. Every selected
+production baseline must pass preflight before any agent in that batch starts;
+selection never permits skipping correctness or preflight.
+
+Selection belongs to developer tooling and changes no engine or policy API. It
+uses captured operator IDs rather than names because overloads, static arguments,
+and layouts distinguish task signatures. Selected tuning requires a completed,
+error-free capture and ready selected operators; blocked operators outside the
+selection remain visible in the capture inventory. Deleting generated tasks was
+rejected: it loses the declared scope and breaks the batch coverage contract.
 
 ATen tasks replay the exact captured overload as their frozen bit-exact reference
 and production baseline. Backend tasks snapshot their existing implementation.
@@ -409,9 +421,9 @@ settings, changed-input graph replay, and declared mutations are validated.
 This is repository tooling under scripts/kernel_tuning and measurement under
 benchmarks/kernel_tuning. A static operator whitelist was rejected because it
 cannot discover model calls; full-model graph compilation was rejected because
-it changes operator boundaries and is outside the no-new-fusion scope. Existing
-catalog tasks remain available explicitly as a legacy workflow. Legacy captures
-cannot establish model coverage and must be recaptured for model tuning.
+it changes operator boundaries and is outside the no-new-fusion scope. Historical
+catalog captures remain baseline-test data. They cannot establish model coverage
+and must be recaptured for model tuning.
 
 CPU regression coverage must exercise uncatalogued operators, model identity,
 all shapes/layouts, quantized scopes (including dynamic modules), unsupported
@@ -421,15 +433,56 @@ CPU/fake-agent passes do not establish GPU correctness or performance.
 
 #### Commands and artifacts
 
-Run preparation in the selected model's own runtime. `PREPARATION.py` below is
-an existing driver that constructs the specified policy through `make_policy`
-and exercises its forward/decode path, with compilation disabled. The capture
-does not launch an extra forward or change the attention backend. Canonical
-policy IDs are those accepted by the factory, for example `pi05`, `streamvln`,
-or `qwen2.5-vl-3b-r2r-low-level`; catalog group names are not model IDs.
+For a single-command model run, save `inference.json` with an actual model input:
+
+```json
+{
+  "policy": {"checkpoint": "/absolute/model/checkpoint"},
+  "engine": {"device": "cuda", "dtype": "auto", "use_cuda_graph": true},
+  "inputs": "observation.pt",
+  "num_steps": 10,
+  "seed": 0
+}
+```
+
+`observation.pt` contains a plain mapping of `Observation` fields, or a nonempty
+list of mappings for a batch: `images`, `state`, `instruction_tokens`, and optional
+`instruction`, `env_id`, `metadata`. Save tensors and ordinary containers with
+`torch.save`; loading uses `weights_only=True`, not arbitrary Python objects.
+Use real inputs valid for the selected policy, including its required metadata
+and tokenization. Only `inputs` is resolved relative to the configuration file;
+policy kwargs are passed unchanged, so use absolute local checkpoint paths.
+There is no synthetic-input or attention-backend substitution. Compilation must
+be disabled and unavailable CUDA is an error rather than a CPU fallback.
+
+```python
+torch.save({
+    "images": observation.images,
+    "state": observation.state,
+    "instruction_tokens": observation.instruction_tokens,
+    "instruction": observation.instruction,
+    "env_id": observation.env_id,
+    "metadata": observation.metadata,
+}, "observation.pt")
+```
 
 ```bash
-/absolute/runtime/python -m scripts.kernel_tuning capture --model pi05 --fixture-bytes 8589934592 --output results/kernel_tuning/captures/pi05 -- PREPARATION.py
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning tune-all --model pi05 --inference-config inference.json --fixture-bytes 8589934592 --agent 'HARNESS/MODEL:EFFORT' --set evaluator_python=/absolute/runtime/python
+# Capture only, directly in the selected model runtime:
+/absolute/runtime/python -m scripts.kernel_tuning capture --model pi05 --inference-config inference.json --fixture-bytes 8589934592 --output results/kernel_tuning/captures/pi05
+```
+
+CPU regression tests use the real synchronous engine with instrumented fake
+policies for every registered ID, checking one execution, preprocessing and
+unlisted internal entry coverage, bit-exact actions, recurrent sessions, RNG
+restoration and failures. These are contract tests, not real-checkpoint parity.
+
+Run capture in the selected model's own runtime. Canonical policy IDs are those
+accepted by the factory, for example `pi05`, `streamvln`, or
+`qwen2.5-vl-3b-r2r-low-level`. The generated capture can then be processed separately:
+
+```bash
+/absolute/runtime/python -m scripts.kernel_tuning capture --model pi05 --inference-config inference.json --fixture-bytes 8589934592 --output results/kernel_tuning/captures/pi05
 uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning generate --model pi05 --captured results/kernel_tuning/captures/pi05 --list
 /absolute/runtime/python -m scripts.kernel_tuning calibrate --captured results/kernel_tuning/captures/pi05 --output results/kernel_tuning/captures/pi05-calibrated
 uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning tune-all --model pi05 --captured results/kernel_tuning/captures/pi05-calibrated --agent 'HARNESS/MODEL:EFFORT' --set evaluator_python=/absolute/runtime/python
@@ -442,8 +495,37 @@ its agent at creation time. Model preflight failures prevent every agent from
 starting. After all baselines pass, an individual search failure is recorded and
 other prepared tasks may continue. Resume rechecks capture/task/tool identities
 and reruns model preflight. The single-task `run`/`resume` paths also check the
-parent model batch. There is no model-mode `--force`, `--estimated`, operator
-filter, multiple-model selection, or `--skip-preflight` option.
+parent model batch. There is no model-mode `--force`, `--estimated`, positional
+operator-name filter, multiple-model selection, or `--skip-preflight` option.
+
+For a deliberately scoped run, pass `--selection selection.json` to `generate` or
+`tune-all`. The JSON object maps captured operator IDs (shown by `generate --list`)
+to `null` for every workload of that operator, or a nonempty list of workload IDs
+from `operators.json`, for example:
+
+```json
+{"<operator-id>": null, "<another-operator-id>": ["<workload-id>"]}
+```
+
+Unknown IDs, duplicate or empty workload lists, and non-ready operators fail before
+task generation. Omitting the option retains full-model behavior. The Python
+`render_model` and `create_model` helpers accept the same mapping as `selection=`.
+The normalized scope is frozen in `tasks/model.json` and `batch.json`; each task
+also records its full selection digest and whether it belongs to an explicit
+selection. Startup and resume
+verify the exact scoped task set, original workload metadata/counts/fixtures, and
+frozen numerical evidence against the full capture. Resume cannot change selection;
+use a new batch. Summaries label explicit selections as scoped results, never as
+full-model coverage, and retain the full capture inventory for context.
+
+For calibrated operators, generation first validates the complete original
+operator calibration, then subsets both its `workloads` and `cases` mappings.
+Every selected profile, seed, output bound, and execution setting is unchanged;
+there is no recalibration or threshold widening. Reporting maxima are recomputed
+only over retained bounds. Performance and correctness evidence applies solely
+to the recorded selection. CPU tests cover excluded operators/workloads, unchanged
+calibration bounds, invalid IDs, changed scope/evidence, the all-selected-preflight
+barrier, and unchanged default full-model coverage.
 
 Capture artifacts are `manifest.json` (actual policy type, builder configuration,
 revision, Torch version, numerical settings, completeness and hashes),
@@ -477,7 +559,8 @@ also requires successful changed-input A/B/A replay. NCU profiling currently
 requires a dedicated replay-aware adapter. Numerical overrides cannot change
 the selected exact contract or the frozen calibrated tolerance contract.
 
-Default-generator `aten.randn.default` and `aten.randn.generator` with
+Default-generator `aten.randn.default`, `aten.randn.generator`, and
+`aten.multinomial.default` with
 `generator=None` have an eager replay contract. Capture stores the opaque CPU
 and target CUDA generator states immediately before and after the existing call,
 within the same required-fixture budget. Seed 0 replays the actual captured
@@ -487,6 +570,10 @@ rejecting extra draws or rewinds even when output values match. State resets
 happen before each warmup/sample, outside timing events, and evaluation restores
 the caller's Torch RNG states on success or failure. Explicit generator objects,
 other random overloads, and RNG tasks using CUDA Graph timing remain gaps.
+Categorical sampling captures its real probability tensor as a required fixture;
+arbitrary random floating inputs could violate its nonnegative-probability contract.
+CPU tests compare the sampled token bytes and exact post-call default-generator
+state against the unchanged ATen baseline, with and without replacement.
 
 SDPA's dispatcher RNG tag is conditional: `dropout_p=0` (including its schema
 default) does not require an RNG replay contract. Discovery resolves positional,
@@ -511,7 +598,7 @@ Known quantization scopes are `QuantizedLinear` (FP8/INT8/NVFP4), conversion and
 packing helpers, their backend functions, and explicit native quantization
 dispatcher operators. Normal integer indices are not a quantization signal.
 Unknown dispatcher extensions and raw Triton launches are reported as gaps;
-random operators outside the default-generator randn contract, opaque Python
+random operators outside the supported default-generator contracts, opaque Python
 arguments, and calls without tensor outputs also require an adapter. Custom
 C++/CUDA calls that bypass both the dispatcher and
 these entrypoints need explicit instrumentation before claiming coverage.
@@ -519,55 +606,11 @@ Capture is a single-process preparation facility; it does not certify unvisited
 branches, other worker processes, or checkpoint-level action parity. Existing
 fused kernels count as one call; no new fused operators are proposed or generated.
 
-### Captured catalog workloads
+### Historical catalog data
 
-Catalog shapes are estimates. `capture --catalog` replaces them with production traffic:
-it runs an unmodified model script in the model's runtime with every catalog
-kernel wrapped, converts each call to the operator's task axes, scalars, and
-fixed integer inputs, and writes one JSONL row per distinct case with its call
-count. Calls outside a task's semantics (another dtype, broadcast tables,
-custom attention scaling) are counted as skipped with the reason. Kernels
-launched while a CUDA Graph is captured are attached to that graph and counted on
-every replay, so production graph configurations can be captured; compilation
-should be disabled. Captures committed under `benchmarks/kernel_tuning/captures/`
-replace the catalog estimates by default, using each operator's most frequent
-cases weighted by call count; `--captured FILE` selects another capture and
-`--estimated` restores the estimates.
-
-Shapes depend on the configuration and the inputs, never on weight values.
-`skeleton REPO --revision REV` therefore builds a random-weight copy of a
-Hugging Face checkpoint: it downloads the small files and synthesizes each
-safetensors file from its header, read with an HTTP range request. Benchmark
-scripts then run unchanged on it, with synthetic frames where the policy resizes
-images to a fixed size anyway. Random weights do not reproduce generated text, so
-decode lengths are fixed in the capture configuration.
-
-`benchmarks/kernel_tuning/captures/pi05-libero10.jsonl` comes from
-`benchmarks/pi05-benchmark` on 200 LIBERO-10 frames (10 tasks), with the
-production Triton paths enabled (`native_inference`, Triton prefix and denoise
-attention). It corrected three estimates. The prefix holds two cameras plus a
-48- or 64-token language bucket (560 or 576 tokens, not 968). `split_kv_attention`
-also runs once per layer over the whole prefix with no cached keys (`P=0`,
-`S=576`). The checkpoint's AdaRMS modulation is BF16, not FP32; the catalog now
-declares BF16 (recalibrated: at most 0.79 of its bound on an RTX 5090). At B=1,
-four of the five pi0.5 kernels measure about 4 µs on an RTX 5090, the device's
-launch floor; only `split_kv_attention` (16-35 µs) leaves room to tune.
-
-The Qwen R2R captures (`qwen-r2r-low.jsonl`, `qwen-r2r-panoramic.jsonl`) use
-skeleton checkpoints and synthetic R2R/RxR episodes (the trajectory release is
-gated; episode lengths follow the benchmark READMEs) with `attention_backend:
-triton` and CUDA Graphs on: only the graph path runs EmbodiInfer's Triton vision
-forward. Each call encodes 4 history frames plus the current one: 1,980 patches
-in 46 ragged windows (low-level) or 7,704 patches in 172 windows (panoramic),
-not the estimated uniform 1,024/4,096. The rotary tables are BF16, which makes
-the production RoPE bit-exact; the catalog now declares both. These shapes put
-`segmented_attention` at 357 µs and 1,405 µs and `rotate_half_rope` at 18 µs and
-61 µs on an RTX 5090. The StreamVLN capture (`streamvln-r2r-rxr.jsonl`, skeleton
-weights, decode capped at the five tokens of its fast action path) sees only
-single-row decode calls: `swiglu` never runs on prefill chunks, and all three
-StreamVLN kernels sit at the launch floor.
-
-```bash
-PYTHONPATH=/path/to/EmbodiInfer /path/to/model-runtime/python -m scripts.kernel_tuning capture --catalog --output pi05.jsonl -- benchmark.py --config capture-config.yaml
-python -m scripts.kernel_tuning tune-all --catalog --model pi05 --captured pi05.jsonl --agent 'HARNESS/MODEL:EFFORT'
-```
+JSONL files under `benchmarks/kernel_tuning/captures/` are retained as historical
+GPU baseline-test fixtures. They are not accepted by capture, generation or model
+tuning. The old external-script and catalog CLI entrypoints have been removed;
+recapture actual inputs through `capture --model MODEL --inference-config CONFIG`
+when migrating a workflow. Random-weight checkpoint preparation remains available
+through `skeleton`, but it does not establish checkpoint-level action parity.

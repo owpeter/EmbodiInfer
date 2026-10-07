@@ -78,12 +78,13 @@ def _execute(store: RunStore, *, resume: bool) -> dict:
             )
 
 
-def _selection(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("operators", nargs="*", help="Catalog operator names (default: all)")
-    parser.add_argument(
-        "--catalog", action="store_true", help="Use the legacy hand-maintained operator catalog"
-    )
+def _selection(parser: argparse.ArgumentParser, *, inference: bool = False) -> None:
     parser.add_argument("--model", action="append", help="One canonical target policy name, e.g. pi05")
+    parser.add_argument(
+        "--selection",
+        type=Path,
+        help="JSON mapping of captured operator IDs to workload ID lists (null means all)",
+    )
     parser.add_argument(
         "--set",
         action="append",
@@ -92,99 +93,87 @@ def _selection(parser: argparse.ArgumentParser) -> None:
         help="Override tuning.yaml, e.g. evaluator_python=/abs/python or search.max_candidates=10",
     )
     parser.add_argument("--hardware-notes", type=Path, help="Target-hardware notes copied into each task")
-    shapes = parser.add_mutually_exclusive_group()
-    shapes.add_argument(
-        "--captured",
-        type=Path,
-        help="Completed model capture directory (legacy JSONL only with --catalog)",
-    )
-    shapes.add_argument("--estimated", action="store_true", help="Use the catalog's estimated shapes")
+    sources = parser.add_mutually_exclusive_group()
+    sources.add_argument("--captured", type=Path, help="Completed model capture directory")
+    if inference:
+        sources.add_argument(
+            "--inference-config",
+            type=Path,
+            help="Run one end-to-end inference from JSON model/engine/input settings, then calibrate and tune",
+        )
+        parser.add_argument(
+            "--fixture-bytes",
+            type=int,
+            help="Input fixture budget for --inference-config (default: 64 MiB)",
+        )
 
 
 def _model_capture(args: argparse.Namespace) -> ModelCapture:
     if not args.model or len(args.model) != 1:
-        raise ContractError(
-            "Model tuning requires exactly one --model; use --catalog for legacy operator selection"
-        )
-    if (
-        args.operators
-        or args.estimated
-        or getattr(args, "force", False)
-        or getattr(args, "skip_preflight", False)
-    ):
-        raise ContractError(
-            "Model tuning requires complete coverage: no operator filter, --estimated, --force, or --skip-preflight"
-        )
+        raise ContractError("Model tuning requires exactly one --model")
     if args.captured is None:
-        raise ContractError("Model tuning requires --captured MODEL_CAPTURE; run capture --model first")
-    return ModelCapture.load(args.captured, args.model[0], require_ready=not getattr(args, "list", False))
+        raise ContractError(
+            "Model tuning requires --captured MODEL_CAPTURE; run capture --inference-config first"
+        )
+    return ModelCapture.load(
+        args.captured, args.model[0], require_ready=not (getattr(args, "list", False) or args.selection)
+    )
+
+
+def _read_selection(path: Path | None) -> dict[str, list[str] | None] | None:
+    if path is None:
+        return None
+    selection = read_json(path)
+    if not isinstance(selection, dict) or not selection:
+        raise ContractError("--selection requires a nonempty JSON object of operator IDs")
+    return selection
 
 
 def _generate(args: argparse.Namespace) -> None:
-    from .capture import apply_file
-    from .generate import parse_overrides, render
-    from .operators import select
+    from .discovery.tasks import render_model
+    from .generate import parse_overrides
 
-    if not args.catalog:
-        from .discovery.tasks import render_model
-
-        capture = _model_capture(args)
-        if args.list:
-            for op in capture.operators:
-                print(
-                    f"{op['status']:20} {op['name']} ({len(op['workloads'])} cases) {op.get('reason') or ''}"
-                )
-            return
-        tasks = render_model(
-            capture, args.output, overrides=parse_overrides(args.set), hardware_notes=args.hardware_notes
-        )
-        for task in tasks:
-            print(f"{task.definition['description']}: {task.root} ({len(task.workloads)} workloads)")
-        return
-
-    operators, notes = apply_file(
-        select(args.operators or None, args.model), args.captured, estimated=args.estimated
-    )
-    for note in notes:
-        print(note)
+    capture = _model_capture(args)
     if args.list:
-        for operator in operators:
-            print(f"{operator.name:22} {','.join(operator.models):10} {operator.summary}")
+        if args.selection:
+            raise ContractError("--list shows the complete capture; omit --selection")
+        for op in capture.operators:
+            print(
+                f"{op['id']} {op['status']:20} {op['name']} "
+                f"({len(op['workloads'])} cases) {op.get('reason') or ''}"
+            )
         return
-    overrides = parse_overrides(args.set)
-    for operator in operators:
-        task = render(
-            operator,
-            args.output / operator.name,
-            overrides=overrides,
-            hardware_notes=args.hardware_notes,
-            force=args.force,
-        )
-        print(
-            f"{operator.name}: {task.root} ({len(task.workloads)} workloads, {task.settings.precision.mode})"
-        )
+    tasks = render_model(
+        capture,
+        args.output,
+        overrides=parse_overrides(args.set),
+        hardware_notes=args.hardware_notes,
+        selection=_read_selection(args.selection),
+    )
+    for task in tasks:
+        print(f"{task.definition['description']}: {task.root} ({len(task.workloads)} workloads)")
 
 
 def _tune_all(args: argparse.Namespace) -> int:
     from . import batch
-    from .capture import apply_file
     from .generate import parse_overrides
-    from .operators import select
 
     if args.resume:
         if (
-            args.operators
-            or args.model
+            args.model
             or args.set
             or args.hardware_notes
             or args.agent
             or args.captured
-            or args.estimated
-            or args.catalog
+            or args.selection
+            or args.inference_config
+            or args.fixture_bytes is not None
         ):
             raise ContractError("--resume continues the recorded batch; omit selection, --set, and --agent")
         root = args.resume.resolve(strict=True)
     else:
+        if args.fixture_bytes is not None and not args.inference_config:
+            raise ContractError("--fixture-bytes requires --inference-config")
         agent = args.agent or ""
         if not (args.dry_run or args.preflight_only) and "/" not in agent:
             raise ContractError("Choose an explicit Humanize2 agent: --agent harness/model:effort")
@@ -193,30 +182,38 @@ def _tune_all(args: argparse.Namespace) -> int:
             "overrides": parse_overrides(args.set),
             "hardware_notes": args.hardware_notes,
         }
-        if args.catalog:
-            operators, notes = apply_file(
-                select(args.operators or None, args.model), args.captured, estimated=args.estimated
+        if args.inference_config:
+            from .discovery.inference import prepare_inference
+
+            if not args.model or len(args.model) != 1 or args.selection:
+                raise ContractError(
+                    "End-to-end tuning requires one --model and every observed operator; omit --selection"
+                )
+            captured = prepare_inference(
+                args.model[0],
+                args.inference_config,
+                args.output,
+                options["overrides"].get("evaluator_python", ""),
+                fixture_bytes=args.fixture_bytes if args.fixture_bytes is not None else 64 * 1024 * 1024,
             )
-            for note in notes:
-                print(note, flush=True)
-            root = batch.create(operators, args.output, **options)
         else:
-            root = batch.create_model(_model_capture(args), args.output, **options)
-    if args.skip_preflight and read_json(root / "batch.json").get("model"):
-        raise ContractError("Model batches cannot skip the all-baseline preflight")
+            captured = _model_capture(args)
+        root = batch.create_model(
+            captured,
+            args.output,
+            selection=_read_selection(args.selection),
+            **options,
+        )
     print(f"Batch: {root}", flush=True)
     if args.dry_run:
         batch.write_summary(root)
         print((root / "summary.md").read_text(encoding="utf-8"))
         return 0
-    if not args.skip_preflight:
-        results = batch.preflight(root)
-        items = read_json(root / "batch.json")["items"]
-        for name, error in results.items():
-            timings = ", ".join(
-                f"{work} {us:.1f} us" for work, us in items[name].get("baseline_us", {}).items()
-            )
-            print(f"preflight {name}: {f'ok ({timings})' if error is None else error}", flush=True)
+    results = batch.preflight(root)
+    items = read_json(root / "batch.json")["items"]
+    for name, error in results.items():
+        timings = ", ".join(f"{work} {us:.1f} us" for work, us in items[name].get("baseline_us", {}).items())
+        print(f"preflight {name}: {f'ok ({timings})' if error is None else error}", flush=True)
     if args.preflight_only:
         batch.write_summary(root)
         return (
@@ -252,32 +249,33 @@ def main(argv: list[str] | None = None) -> int:
     generate = commands.add_parser("generate", help="Write every discovered model task; no execution")
     _selection(generate)
     generate.add_argument("--output", type=Path, default=REPOSITORY / "results/kernel_tuning/tasks")
-    generate.add_argument(
-        "--force", action="store_true", help="Replace previously generated task directories"
-    )
     generate.add_argument("--list", action="store_true", help="List discovered operators and coverage gaps")
     tune_all = commands.add_parser("tune-all", help="Generate, preflight, and tune every selected operator")
-    _selection(tune_all)
+    _selection(tune_all, inference=True)
     tune_all.add_argument("--agent", help="Explicit Humanize2 harness/model:effort spec for every operator")
     tune_all.add_argument("--output", type=Path, default=REPOSITORY / "results/kernel_tuning/batches")
     tune_all.add_argument("--resume", type=Path, metavar="BATCH", help="Continue an existing batch directory")
     mode = tune_all.add_mutually_exclusive_group()
-    mode.add_argument("--dry-run", action="store_true", help="Only generate and validate the tasks")
-    mode.add_argument("--preflight-only", action="store_true", help="Stop after measuring the baselines")
-    mode.add_argument("--skip-preflight", action="store_true", help="Let each run measure its baseline")
-    capture = commands.add_parser(
-        "capture", help="Record production kernel shapes while a model script runs (model runtime)"
+    mode.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Generate tasks without preflight or agents; inference inputs still run capture and calibration",
     )
-    capture.add_argument("operators", nargs="*", help="Catalog operators to record (default: all)")
-    capture.add_argument("--catalog", action="store_true", help="Record legacy catalog-only JSONL")
-    capture.add_argument("--model", help="Canonical policy name constructed by the preparation script")
+    mode.add_argument("--preflight-only", action="store_true", help="Stop after measuring the baselines")
+    capture = commands.add_parser(
+        "capture", help="Run one complete synchronous model inference and record its operators"
+    )
+    capture.add_argument("--model", required=True, help="Canonical policy name")
+    capture.add_argument(
+        "--inference-config",
+        type=Path,
+        required=True,
+        help="JSON model/engine/input settings for one end-to-end inference",
+    )
     capture.add_argument(
         "--fixture-bytes", type=int, default=64 * 1024 * 1024, help="Maximum stored input fixture bytes"
     )
-    capture.add_argument(
-        "--output", type=Path, required=True, help="New model capture directory (JSONL for --catalog)"
-    )
-    capture.add_argument("script", nargs=argparse.REMAINDER, help="-- SCRIPT [ARGS] or -- -m MODULE [ARGS]")
+    capture.add_argument("--output", type=Path, required=True, help="New model capture directory")
     calibration = commands.add_parser(
         "calibrate", help="Freeze baseline/FP64 numerical bounds in the model runtime before generation"
     )
@@ -290,39 +288,29 @@ def main(argv: list[str] | None = None) -> int:
     skeleton.add_argument("--revision", required=True, help="Immutable commit to copy")
     skeleton.add_argument("--output", type=Path, required=True)
     raw = sys.argv[1:] if argv is None else argv
-    if "--" in raw and raw[0] == "capture":
-        split = raw.index("--")
-        raw, command = raw[:split], raw[split + 1 :]
-    else:
-        command = None
-    args = parser.parse_args(raw)
+    try:
+        args = parser.parse_args(raw)
+    except SystemExit as exc:
+        return int(exc.code or 0)
     try:
         if args.command == "capture":
-            if args.catalog:
-                from .capture import run as run_capture
-                from .operators import select
+            from .discovery.inference import capture_inference
 
-                if args.model:
-                    raise ContractError("Legacy catalog capture does not bind a model; omit --model")
-                rows = run_capture(command or args.script, args.output, select(args.operators or None))
-                calls = sum(row["count"] for row in rows if "axes" in row)
-                print(
-                    f"Captured {calls} calls in {sum('axes' in row for row in rows)} cases -> {args.output}"
+            captured = capture_inference(
+                args.model, args.inference_config, args.output, fixture_bytes=args.fixture_bytes
+            )
+            print(
+                json.dumps(
+                    {
+                        "model": args.model,
+                        "identity": captured.identity,
+                        "operators": len(captured.operators),
+                        "execution": captured.manifest["execution"],
+                    },
+                    indent=2,
+                    ensure_ascii=False,
                 )
-                for row in rows:
-                    if "skipped" in row:
-                        print(f"  skipped {row['count']} {row['operator']} calls: {row['skipped']}")
-            else:
-                from .discovery.recorder import run as run_model_capture
-
-                if not args.model or args.operators:
-                    raise ContractError(
-                        "Capture requires one --model and no operator filter; use --catalog for legacy capture"
-                    )
-                result = run_model_capture(
-                    command or args.script, args.output, args.model, fixture_bytes=args.fixture_bytes
-                )
-                print(json.dumps(result, indent=2, ensure_ascii=False))
+            )
         elif args.command == "calibrate":
             from benchmarks.kernel_tuning.calibration import calibrate
 

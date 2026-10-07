@@ -7,11 +7,11 @@ import importlib.util
 import json
 import struct
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
-from scripts.kernel_tuning.capture import apply_file
 from scripts.kernel_tuning.contracts import ContractError, TaskPackage, read_json
 from scripts.kernel_tuning.generate import (
     MARKER,
@@ -22,7 +22,7 @@ from scripts.kernel_tuning.generate import (
     tuning_settings,
     vendor_sources,
 )
-from scripts.kernel_tuning.operators import OPERATORS, catalog, select
+from scripts.kernel_tuning.operators import OPERATORS, Workload, catalog, select
 
 
 @pytest.fixture(scope="module")
@@ -184,7 +184,30 @@ def test_production_baseline_meets_generated_contract(name: str, tmp_path: Path)
     spec.loader.exec_module(adapter)
     compare = adapter.compare_outputs
 
-    (operator,), _ = apply_file([catalog()[name]])  # calibrate on the committed captured shapes
+    operator = catalog()[name]
+    rows = [
+        json.loads(line)
+        for path in sorted((REPOSITORY / "benchmarks/kernel_tuning/captures").glob("*.jsonl"))
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    cases = sorted(
+        (row for row in rows if row["operator"] == name and "axes" in row), key=lambda row: -row["count"]
+    )
+    if cases:
+        operator = replace(
+            operator,
+            workloads=tuple(
+                Workload(
+                    f"captured{index + 1}",
+                    row["axes"],
+                    scalars=row.get("scalars", {}),
+                    fixed={key: tuple(values) for key, values in row.get("fixed", {}).items()},
+                    weight=float(row["count"]),
+                )
+                for index, row in enumerate(cases[:8])
+            ),
+        )
     task = render(operator, tmp_path / "task")
     baseline = _load_baseline(task, tmp_path / "build")
     reference_scope: dict[str, Any] = {}

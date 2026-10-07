@@ -302,11 +302,8 @@ def test_model_cli_rejects_partial_selection_and_legacy_capture(tmp_path: Path, 
     assert not (tmp_path / "runs").exists()
 
 
-def test_factory_driver_is_scoped_and_does_not_execute_an_extra_forward(tmp_path: Path, monkeypatch) -> None:
-    import sys
+def test_factory_binding_does_not_install_method_scopes(tmp_path: Path, monkeypatch) -> None:
     from types import SimpleNamespace
-
-    from scripts.kernel_tuning.discovery import recorder
 
     from embodiinfer.policies import factory
 
@@ -322,47 +319,37 @@ def test_factory_driver_is_scoped_and_does_not_execute_an_extra_forward(tmp_path
 
     policy = FakePolicy()
     monkeypatch.setitem(factory._REGISTRY, "mock_flow_vla", lambda **kwargs: policy)
-    # The public CLI always targets CUDA; this test substitutes the observer's
-    # device classification while exercising the real driver and factory hooks.
-    monkeypatch.setattr(
-        recorder, "CaptureSession", lambda *args, **kwargs: CaptureSession(*args, device_type="cpu", **kwargs)
-    )
-    script = tmp_path / "prepare.py"
-    script.write_text(
-        "import torch\nfrom embodiinfer.policies.factory import make_policy\nx = torch.ones(3)\nx.sin()  # outside the selected policy\nmodel = make_policy('mock_flow_vla', checkpoint='test')\nmodel(x)\n",
-        encoding="utf-8",
-    )
-    argv, path = sys.argv, sys.path[:]
-    recorder.run([str(script)], tmp_path / "capture", "mock_flow_vla")
-    capture = ModelCapture.load(tmp_path / "capture")
-    assert [op["name"] for op in capture.operators] == ["aten.relu.default"]
+    session = CaptureSession("mock_flow_vla", tmp_path / "capture", device_type="cpu")
+    try:
+        session.install()
+        model = factory.make_policy("mock_flow_vla", checkpoint="test")
+        inputs = torch.ones(3)
+        inputs.cos()
+        with session.observe(model, checkpoint="test"):
+            model(inputs)
+            inputs.sin()
+    finally:
+        session.close(complete=True)
+    capture = ModelCapture.load(session.root)
+    assert {op["name"] for op in capture.operators} == {"aten.relu.default", "aten.sin.default"}
     assert policy.calls == 1
     assert "forward" not in vars(policy)
-    assert sys.argv is argv and sys.path == path
     assert capture.manifest["target"]["config"] == {"checkpoint": "test"}
 
 
-def test_decoder_integrate_entry_is_observed(tmp_path: Path, monkeypatch) -> None:
-    # Benchmarks may time the flow loop through decoder.integrate rather than produce_chunk.
+@pytest.mark.parametrize("entry", ["integrate", "decode", "custom_decode"])
+def test_decoder_entries_are_observed_in_the_outer_scope(tmp_path: Path, entry: str) -> None:
     from types import SimpleNamespace
 
-    from scripts.kernel_tuning.discovery import recorder
-
-    from embodiinfer.policies import factory
-
-    policy = SimpleNamespace(decoder=SimpleNamespace(integrate=lambda x: x.relu()))
-    monkeypatch.setitem(factory._REGISTRY, "mock_flow_vla", lambda **kwargs: policy)
-    monkeypatch.setattr(
-        recorder, "CaptureSession", lambda *args, **kwargs: CaptureSession(*args, device_type="cpu", **kwargs)
-    )
-    script = tmp_path / "prepare.py"
-    script.write_text(
-        "import torch\nfrom embodiinfer.policies.factory import make_policy\nmodel = make_policy('mock_flow_vla', checkpoint='test')\nmodel.decoder.integrate(torch.ones(3))\n",
-        encoding="utf-8",
-    )
-    recorder.run([str(script)], tmp_path / "capture", "mock_flow_vla")
-    capture = ModelCapture.load(tmp_path / "capture")
-    assert [op["name"] for op in capture.operators] == ["aten.relu.default"]
+    policy = SimpleNamespace(decoder=SimpleNamespace(**{entry: lambda x: x.relu()}))
+    session = CaptureSession("mock_flow_vla", tmp_path / "capture", device_type="cpu")
+    try:
+        with session.observe(policy):
+            getattr(policy.decoder, entry)(torch.ones(3))
+    finally:
+        session.close(complete=True)
+    capture = ModelCapture.load(session.root)
+    assert "aten.relu.default" in {op["name"] for op in capture.operators}
 
 
 def test_replay_adapter_checks_output_alias_and_undeclared_mutation_on_cpu(tmp_path: Path) -> None:

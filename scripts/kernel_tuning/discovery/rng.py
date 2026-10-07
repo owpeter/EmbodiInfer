@@ -1,4 +1,4 @@
-"""Argument-aware RNG classification and exact default-generator randn replay."""
+"""Argument-aware RNG classification and exact default-generator sampling replay."""
 
 from __future__ import annotations
 
@@ -12,11 +12,20 @@ import torch
 from ..contracts import ContractError
 from .contracts import RNG_OVERLOADS
 
+_SDPA = {
+    "aten.scaled_dot_product_attention.default",
+    "aten._scaled_dot_product_attention_math.default",
+    "aten._scaled_dot_product_flash_attention.default",
+    "aten._scaled_dot_product_flash_attention_for_cpu.default",
+    "aten._scaled_dot_product_efficient_attention.default",
+    "aten._scaled_dot_product_cudnn_attention.default",
+}
+
 
 def requires_rng_adapter(function: Any, args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
     """Treat seeded tags as conditional for SDPA with explicitly zero/default dropout."""
     tags = {tag for tag in getattr(function, "tags", ()) if "nondeterministic" in str(tag)}
-    if str(function) == "aten.scaled_dot_product_attention.default":
+    if str(function) in _SDPA:
         for index, argument in enumerate(function._schema.arguments):
             if argument.name == "dropout_p":
                 dropout = kwargs.get(
@@ -28,11 +37,17 @@ def requires_rng_adapter(function: Any, args: tuple[Any, ...], kwargs: dict[str,
     return bool(tags)
 
 
-def contract_for(name: str, kwargs: dict[str, Any]) -> dict[str, Any] | None:
-    """Recognize randn with the default CPU/CUDA generator; other RNG calls stay gaps."""
+def contract_for(name: str, kwargs: dict[str, Any], args: tuple = ()) -> dict[str, Any] | None:
+    """Recognize default-generator noise and categorical sampling on CPU/CUDA."""
     if name not in RNG_OVERLOADS or kwargs.get("generator") is not None:
         return None
-    device = torch.device(kwargs.get("device") or torch.get_default_device())
+    if name == "aten.multinomial.default":
+        weights = args[0] if args else kwargs.get("self")
+        if not isinstance(weights, torch.Tensor):
+            return None
+        device = weights.device
+    else:
+        device = torch.device(kwargs.get("device") or torch.get_default_device())
     if device.type not in {"cpu", "cuda"}:
         return None
     devices = ["cpu"]

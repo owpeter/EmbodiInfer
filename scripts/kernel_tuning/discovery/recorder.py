@@ -6,7 +6,6 @@ import functools
 import hashlib
 import importlib
 import inspect
-import runpy
 import sys
 from collections import Counter
 from collections.abc import Iterator
@@ -118,7 +117,7 @@ class _Observer(TorchDispatchMode):
         short = name.split(".")[1] if name.startswith("aten.") else name
         reason = None
         with session.silence():
-            rng = contract_for(name, kwargs)
+            rng = contract_for(name, kwargs, args)
         if not name.startswith("aten."):
             reason = "External dispatcher operator needs a reference adapter"
         if rng is None and requires_rng_adapter(func, args, kwargs):
@@ -152,7 +151,7 @@ class CaptureSession:
 
     Use ``observe`` around existing preparation execution for custom drivers. The
     CLI additionally binds a target constructed by the public policy factory.
-    ``device_type='cpu'`` is useful for deterministic observer unit tests only.
+    ``device_type='cpu'`` supports deterministic unit tests and inference smoke runs.
     """
 
     def __init__(
@@ -174,6 +173,7 @@ class CaptureSession:
         self._fixtures: dict[str, list[dict[str, Any]]] = {}
         self.graphs: dict[int, Counter] = {}
         self.graph_stack: list[Counter] = []
+        self.execution: dict[str, Any] | None = None
         self._numerics_bound = False
         self._set_numerics()
 
@@ -237,7 +237,7 @@ class CaptureSession:
     ) -> list[dict[str, Any]]:
         if key in self._fixtures:
             return self._fixtures[key]
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        if self.device_type == "cuda" and torch.cuda.is_current_stream_capturing():
             if any(not tensor.is_floating_point() for tensor in tensors):
                 raise ContractError("Valid non-floating fixtures must be observed during eager warmup")
             return specs
@@ -282,7 +282,7 @@ class CaptureSession:
         return specs
 
     def _rng_snapshot(self, devices: list[str]) -> dict[str, str]:
-        if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+        if self.device_type == "cuda" and torch.cuda.is_current_stream_capturing():
             raise ContractError("RNG fixtures require eager preparation outside CUDA Graph capture")
         result = {}
         for device, state in rng_snapshot(devices).items():
@@ -365,7 +365,10 @@ class CaptureSession:
                     raise ContractError(reason)
                 if status == "ready":
                     case["inputs"] = self._snapshot(
-                        digest([identity, specs]), tensors, specs, real_inputs=policy(identity) is not None
+                        digest([identity, specs]),
+                        tensors,
+                        specs,
+                        real_inputs=policy(identity) is not None or rng is not None,
                     )
                 if rng is not None:
                     identity["rng"] = rng
@@ -481,7 +484,7 @@ class CaptureSession:
         return wrapper
 
     def install(self) -> None:
-        """Install process-local quantization, backend, factory, and graph observation hooks."""
+        """Install backend/factory/graph hooks for a complete outer ``observe`` scope."""
         from embodiinfer.models import linear
         from embodiinfer.policies import factory
 
@@ -524,23 +527,6 @@ class CaptureSession:
                 raise ContractError("Disable torch.compile explicitly before model discovery")
             policy = original_factory(name, **kwargs)
             self.bind(policy, kwargs)
-            for holder, methods in (
-                (policy, ("encode_prefix", "denoise_step", "prepare_prefix", "forward")),
-                (policy.decoder, ("produce_chunk", "integrate", "generate_tokens", "init_state")),
-            ):
-                for method in methods:
-                    if not hasattr(holder, method):
-                        continue
-                    original = getattr(holder, method)
-
-                    def execute(*args: Any, _fn: Any = original, **kw: Any) -> Any:
-                        self.depth += 1
-                        try:
-                            return _fn(*args, **kw)
-                        finally:
-                            self.depth -= 1
-
-                    self._replace(holder, method, execute)
             return policy
 
         self._replace_function(original_factory, construct)
@@ -618,6 +604,7 @@ class CaptureSession:
                 "schema": SCHEMA,
                 "target": self.target,
                 "complete": complete,
+                **({"execution": self.execution} if self.execution is not None else {}),
                 "errors": self.errors,
                 "repository_revision": _git_revision(),
                 "torch_version": str(torch.__version__),
@@ -630,37 +617,3 @@ class CaptureSession:
                 "files": tree_hashes(self.root),
             },
         )
-
-
-def run(
-    command: list[str], output: Path, model: str, *, fixture_bytes: int = 64 * 1024 * 1024
-) -> dict[str, Any]:
-    """Execute an existing model preparation script with model-scoped observation."""
-    if not command:
-        raise ContractError("Supply the preparation script after --")
-    session = CaptureSession(model, output, fixture_bytes=fixture_bytes)
-    argv, path = sys.argv, sys.path[:]
-    complete = False
-    try:
-        session.install()
-        with _Observer(session):
-            if command[0] == "-m":
-                sys.argv = command[1:]
-                runpy.run_module(command[1], run_name="__main__", alter_sys=True)
-            else:
-                script = Path(command[0]).resolve()
-                sys.argv = [str(script), *command[1:]]
-                sys.path.insert(0, str(script.parent))
-                runpy.run_path(str(script), run_name="__main__")
-        complete = True
-    except SystemExit as exc:
-        complete = exc.code in (None, 0)
-        if not complete:
-            raise
-    finally:
-        sys.argv, sys.path = argv, path
-        session.close(complete=complete)
-    from .contracts import ModelCapture
-
-    capture = ModelCapture.load(output, model)
-    return {"model": model, "identity": capture.identity, "operators": len(capture.operators)}

@@ -11,7 +11,7 @@ from ..contracts import ContractError, digest, read_json, relative_path, tree_ha
 
 SCHEMA = "embodiinfer-model-capture-v1"
 DISPOSITIONS = {"ready", "excluded_quantized", "metadata_only", "host_only", "blocked"}
-RNG_OVERLOADS = {"aten.randn.default", "aten.randn.generator"}
+RNG_OVERLOADS = {"aten.randn.default", "aten.randn.generator", "aten.multinomial.default"}
 REPLAY_SCHEMA = "embodiinfer-replay-v1"
 
 
