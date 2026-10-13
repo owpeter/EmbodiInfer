@@ -278,6 +278,43 @@ def main(argv: list[str] | None = None) -> int:
         "--output", type=Path, required=True, help="New model capture directory (JSONL for --catalog)"
     )
     capture.add_argument("script", nargs=argparse.REMAINDER, help="-- SCRIPT [ARGS] or -- -m MODULE [ARGS]")
+    capture_ops = commands.add_parser(
+        "capture-ops", help="Record operator-registry calls as a tunable model capture (model runtime)"
+    )
+    capture_ops.add_argument("--model", required=True, help="Canonical policy name built by the driver")
+    capture_ops.add_argument("--ops", help="Comma-separated registry operators (default: every one called)")
+    capture_ops.add_argument("--warmup", type=int, default=2, help="Inference steps skipped before recording")
+    capture_ops.add_argument("--steps", type=int, default=8, help="Inference steps recorded")
+    capture_ops.add_argument(
+        "--fixture-bytes", type=int, default=1 << 30, help="Maximum stored real-input bytes"
+    )
+    capture_ops.add_argument("--output", type=Path, required=True, help="New capture directory")
+    capture_ops.add_argument(
+        "script", nargs=argparse.REMAINDER, help="-- SCRIPT [ARGS] or -- -m MODULE [ARGS]"
+    )
+    install = commands.add_parser(
+        "install", help="Install an exported registry solution into a kernel profile (model runtime)"
+    )
+    install.add_argument("export", type=Path, help="Directory written by export")
+    install.add_argument("--profile", required=True, help="Kernel profile name, e.g. thor or rtx4090")
+    install.add_argument("--replace", action="store_true", help="Overwrite an installed operator")
+    verify = commands.add_parser(
+        "verify", help="Model-level numerical gate for a kernel profile (model runtime)"
+    )
+    verify.add_argument("--profile", required=True, help="Installed kernel profile to check")
+    verify.add_argument("--output", type=Path, required=True, help="New gate report (JSON)")
+    verify.add_argument("--samples", type=int, help="Use only the first N recorded inputs")
+    verify.add_argument("--seed", type=int, default=1000, help="Base of the per-input seeds")
+    verify.add_argument("script", nargs=argparse.REMAINDER, help="-- discovery.drive arguments")
+    hotspots = commands.add_parser(
+        "profile", help="Rank where end-to-end inference spends GPU time (model runtime)"
+    )
+    hotspots.add_argument("--output", type=Path, required=True, help="New profile directory")
+    hotspots.add_argument("--warmup", type=int, default=10, help="Inference steps skipped before profiling")
+    hotspots.add_argument("--steps", type=int, default=20, help="Inference steps profiled")
+    hotspots.add_argument("--no-module-ranges", action="store_true", help="Skip per-nn.Module attribution")
+    hotspots.add_argument("--trace", action="store_true", help="Also write a Chrome trace.json")
+    hotspots.add_argument("script", nargs=argparse.REMAINDER, help="-- SCRIPT [ARGS] or -- -m MODULE [ARGS]")
     calibration = commands.add_parser(
         "calibrate", help="Freeze baseline/FP64 numerical bounds in the model runtime before generation"
     )
@@ -290,7 +327,7 @@ def main(argv: list[str] | None = None) -> int:
     skeleton.add_argument("--revision", required=True, help="Immutable commit to copy")
     skeleton.add_argument("--output", type=Path, required=True)
     raw = sys.argv[1:] if argv is None else argv
-    if "--" in raw and raw[0] == "capture":
+    if "--" in raw and raw[0] in ("capture", "capture-ops", "profile", "verify"):
         split = raw.index("--")
         raw, command = raw[:split], raw[split + 1 :]
     else:
@@ -323,6 +360,50 @@ def main(argv: list[str] | None = None) -> int:
                     command or args.script, args.output, args.model, fixture_bytes=args.fixture_bytes
                 )
                 print(json.dumps(result, indent=2, ensure_ascii=False))
+        elif args.command == "capture-ops":
+            from .regions import run as run_op_capture
+
+            ops = {name.strip() for name in args.ops.split(",") if name.strip()} if args.ops else None
+            result = run_op_capture(
+                command or args.script,
+                args.output,
+                args.model,
+                ops=ops,
+                warmup=args.warmup,
+                steps=args.steps,
+                fixture_bytes=args.fixture_bytes,
+            )
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        elif args.command == "install":
+            from .install import install as install_solution
+
+            result = install_solution(args.export, args.profile, replace=args.replace)
+            print(json.dumps(result, indent=2, ensure_ascii=False))
+        elif args.command == "verify":
+            from .verify import run as run_verify
+
+            report = run_verify(
+                args.profile, args.output, command or args.script, samples=args.samples, seed=args.seed
+            )
+            summary = {key: report[key] for key in ("passed", "inputs", "failed", "worst_ratio")}
+            summary["outputs"] = {name: item["ratio"] for name, item in report["outputs"].items()}
+            print(json.dumps(summary, indent=2))
+            if not report["passed"]:
+                return 1
+        elif args.command == "profile":
+            from .hotspots import render
+            from .hotspots import run as run_profile
+
+            summary = run_profile(
+                command or args.script,
+                args.output,
+                warmup=args.warmup,
+                steps=args.steps,
+                modules=not args.no_module_ranges,
+                trace=args.trace,
+            )
+            print(render(summary, limit=15))
+            print(f"Report: {args.output / 'hotspots.md'}")
         elif args.command == "calibrate":
             from benchmarks.kernel_tuning.calibration import calibrate
 
