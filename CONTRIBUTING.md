@@ -52,6 +52,129 @@ exclusive, so uv rejects combinations with incompatible Torch or Transformers
 requirements. Declare new dependencies in the right group and regenerate the
 lock against the public index.
 
+### Optional kernel tuning tools
+
+Kernel tuning is repository developer tooling. Its Humanize2 (`hmz`) environment
+requires Python 3.12+, separately from the inference runtime and its model groups.
+
+Real searches run on the Linux/POSIX target machine: the pinned Humanize2 release
+uses POSIX journaling primitives. Task checks and artifact inspection/export also
+work on Windows. Windows CPU tests adapt only that upstream file-write primitive;
+they are not a claim of native Windows coding-agent support.
+
+```bash
+uv sync --project scripts/kernel_tuning --python 3.12 --frozen
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning --help
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning generate --catalog gated_residual --output results/kernel_tuning/tasks
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning check results/kernel_tuning/tasks/gated_residual
+```
+
+To tune one model, capture its existing preparation forward and calibrate numerical
+contracts in its model runtime, then generate and preflight every eligible call
+(see [model discovery](docs/proposals/0008-kernel-tuning.md#model-scoped-operator-discovery)):
+
+```bash
+/absolute/runtime/python -m scripts.kernel_tuning capture --model pi05 --fixture-bytes 8589934592 --output results/kernel_tuning/captures/pi05 -- /absolute/preparation.py
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning generate --model pi05 --captured results/kernel_tuning/captures/pi05 --list
+/absolute/runtime/python -m scripts.kernel_tuning calibrate --captured results/kernel_tuning/captures/pi05 --output results/kernel_tuning/captures/pi05-calibrated
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning tune-all --model pi05 --captured results/kernel_tuning/captures/pi05-calibrated --agent 'HARNESS/MODEL:EFFORT' --set evaluator_python=/absolute/runtime/python
+uv run --project scripts/kernel_tuning python -m scripts.kernel_tuning tune-all --resume results/kernel_tuning/batches/BATCH_ID
+```
+
+`/absolute/preparation.py` is your existing preparation driver, constructing the
+selected canonical policy through `make_policy` and running its normal forward
+path. Disable compilation explicitly; select the same checkpoint, backend,
+dtype, batching and decoding settings that will be tuned. Discovery covers only
+paths exercised by that preparation. The capture records ATen overloads and
+existing backend entrypoints, all observed shapes/layouts, and call counts.
+Quantized calls and their internals are excluded; views/allocations and host work
+are listed separately. No new fusion is introduced. A missing replay contract,
+required fixture, or failing baseline blocks the entire model batch. `--dry-run`
+only builds tasks; `--preflight-only` measures baselines without opening agents.
+Model batches cannot use `--skip-preflight`, partial operator selection, or
+estimated shapes. A standalone `run` cannot bypass their preflight barrier.
+
+The default fixture budget is 64 MiB; the example raises the upper limit to 8 GiB
+without allocating it up front. Supported floating matmul/linear, reductions,
+softmax and attention require complete real input fixtures, including weights.
+Increase `--fixture-bytes` for the observed model; exhaustion fails explicitly.
+Other exact tasks retain optional small floating fixtures and required integer
+fixtures. Calibration compares only the production baseline and an FP64 reference
+on recorded, random and boundary inputs. It stores per-workload/profile/output
+bounds in a new hashed capture. Generation copies them to `numerics.json`; every
+element must pass, and seeds/thresholds/execution settings cannot be overridden.
+Calibration costs extra storage and target-device compute, before any agent runs.
+Use a new capture/calibration/batch when changing settings. Old runs keep their
+original contract; old captures with incomplete real inputs need recapture.
+
+Default-generator `randn` tasks save required before/after RNG fixtures, check
+both output bytes and generator advancement, and support eager timing only.
+Explicit generators and other unsupported RNG calls remain coverage gaps.
+SDPA with zero/default dropout is eligible; nonzero dropout still needs an adapter.
+Discovered float64 tensors use the opt-in replay definition schema and retain
+double precision through task generation and evaluation.
+
+The old catalog workflow remains available explicitly with `generate --catalog`,
+`tune-all --catalog`, and `capture --catalog`. Only that workflow accepts legacy
+JSONL captures, catalog model groups, operator subsets and `--estimated`; it
+does not certify model coverage. Existing JSONL must be recaptured for model tuning.
+
+Run these commands from the repository root. Humanize2 is pinned to a reviewed
+source revision in the tool's `pyproject.toml`; it drives an existing, separately
+installed coding-agent CLI. Select the harness/model/effort explicitly when
+starting a search. `run` and `resume` execute real agent turns and kernels;
+`check`, `status`, and `export` do not. `check --environment` additionally imports
+the task evaluator and probes dependencies/hardware, without compiling candidates.
+
+On the target machine, set the task's `evaluator_python` to the absolute Python
+executable of its prepared GPU runtime. Install
+`benchmarks/kernel_tuning/requirements.txt` there under that runtime's constraints.
+In particular, preserve Thor's compatible Torch/CUDA/Triton versions; do not copy
+the tooling interpreter's packages or another GPU's Torch pins over them. Inspect
+the proposed dependency changes first, for example with
+`uv --no-config pip install --dry-run --python /absolute/runtime/python -r benchmarks/kernel_tuning/requirements.txt -c /absolute/runtime/constraints.txt`.
+For a separately prepared GPU runtime, `--no-config` avoids applying this
+repository's development-only Torch upper bound. Pin that runtime's Torch,
+Triton, and CUDA packages in the constraints file and inspect the installation
+plan before applying it. When inheriting system packages, verify that the installer
+actually reuses them; do not reinstall the GPU stack just to add the evaluator.
+For a custom evaluator, install only its declared dependencies plus PyYAML.
+
+See the [approved contract](docs/proposals/0008-kernel-tuning.md).
+The [Chinese workflow guide](docs/proposals/0008-kernel-tuning.md#11-自动化调优使用说明)
+explains task inputs, the full tuning loop, stopping conditions, and saved results.
+The controller snapshots task inputs, saves all attempts, and exports improving
+solutions with their correctness and timing evidence under `results/kernel_tuning/`.
+Saved operators require a separate review/integration before runtime use.
+For an unregistered operator, the
+[registration workflow](scripts/kernel_tuning/registration/README.md) creates an
+isolated review branch with `register new`, then runs a resumable CPU
+plan/implement/check/repair loop with `register run`. Supply a prepared model
+interpreter using `--set test_python=/absolute/runtime/python` on `new` (and, if
+needed, the first `run`). `finalize` exports the checked patch; commit and push
+are explicit options. This registration gate does not replace target-GPU
+whole-model bit-exact verification before merge.
+Humanize2 agents may execute commands without interactive approval; the scratch
+directory and content hashes are not an OS sandbox. Use an appropriate isolated
+account/container on the target host when needed.
+
+CPU tests for the tooling use official Humanize2 fake agents and fake evaluators,
+without a coding-agent account or GPU stack:
+
+```bash
+uv run --project scripts/kernel_tuning python -m pytest tests/kernel_tuning --confcutdir=tests/kernel_tuning -q
+uv run --project scripts/kernel_tuning ruff check scripts/kernel_tuning benchmarks/kernel_tuning tests/kernel_tuning
+uv run --project scripts/kernel_tuning ruff format --check scripts/kernel_tuning benchmarks/kernel_tuning tests/kernel_tuning
+```
+
+CPU discovery/replay tests also need Torch in the selected interpreter; they do
+not load checkpoints or run GPU tuning. The `--confcutdir` option avoids loading the core test suite's Torch-dependent
+fixtures in the separate tooling environment. Optional numerical/GPU tests skip
+when their dependencies/hardware are unavailable; skips are not GPU validation.
+After preparing the target GPU runtime and CUDA toolkit, exercise both the Triton
+and CUDA C++ builders, byte-level correctness, and changed-input CUDA Graph replay
+with `/absolute/runtime/python -m pytest tests/kernel_tuning/test_numerics.py --confcutdir=tests/kernel_tuning -q`.
+
 ## Checks to run
 
 ```bash
