@@ -33,6 +33,8 @@ step (never mutated), so there is no HF ``DynamicCache`` to defend against.
 
 from __future__ import annotations
 
+import functools
+import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from threading import Lock
@@ -40,6 +42,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
+from torch import nn
 
 from ...engine.parallel import TensorParallelContext
 from ...layers import KernelSelection, get_attention_backend, get_split_kv_attention_backend
@@ -96,6 +99,40 @@ def _op(kernels: KernelSelection | None, op: str, use_triton: bool):
     """
     selection = _DEFAULT_KERNELS if kernels is None else kernels
     return selection.resolve(op, "triton" if use_triton else "torch")
+
+
+def _is_gelu_tanh(activation: Any) -> bool:
+    """Recognize plain tanh GELU modules whose calls can use the tensor operator."""
+    if type(activation) is nn.GELU:
+        if activation.approximate != "tanh":
+            return False
+    else:
+        # A loaded SigLIP activation already has this optional dependency in
+        # sys.modules. Compare the class itself, never its name or a subclass.
+        activations = sys.modules.get("transformers.activations")
+        if activations is None or type(activation) is not getattr(activations, "PytorchGELUTanh", None):
+            return False
+        # GELUTanh(use_gelu_tanh_python=True) ("gelu_python_tanh") evaluates a
+        # Python formula that is not bit-identical to F.gelu; only the native
+        # partial may use the operator.
+        act = activation.__dict__.get("act")
+        if not (
+            isinstance(act, functools.partial)
+            and act.func is F.gelu
+            and not act.args
+            and act.keywords == {"approximate": "tanh"}
+        ):
+            return False
+    # Module hooks and instance overrides may change values or gradients.
+    return (
+        "forward" not in activation.__dict__
+        and "_call_impl" not in activation.__dict__
+        and getattr(activation, "_compiled_call_impl", None) is None
+        and not activation._forward_hooks
+        and not activation._forward_pre_hooks
+        and not activation._backward_hooks
+        and not activation._backward_pre_hooks
+    )
 
 
 # ---- attention math (reimplemented to match HF Gemma exactly) ---------------
@@ -207,7 +244,9 @@ def _packed_quantized_projection(
     return packed
 
 
-def _fused_linear_pair(x: torch.Tensor, first: Any, second: Any) -> tuple[torch.Tensor, torch.Tensor]:
+def _fused_linear_pair(
+    x: torch.Tensor, first: Any, second: Any, *, kernels: KernelSelection | None
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Evaluate two bias-free projections as one GEMM and split the result."""
     if torch.is_grad_enabled() or first.training or second.training:
         return first(x), second(x)
@@ -225,7 +264,7 @@ def _fused_linear_pair(x: torch.Tensor, first: Any, second: Any) -> tuple[torch.
     if weight is None or weight.device != first.weight.device or weight.dtype != first.weight.dtype:
         weight = torch.cat((first.weight, second.weight), dim=0).contiguous()
         first._vvla_fused_pair_weight = weight
-    fused = F.linear(x, weight)
+    fused = _op(kernels, "linear", False)(x, weight)
     return fused.split((first.out_features, second.out_features), dim=-1)
 
 
@@ -305,14 +344,17 @@ def _mlp(
     kernels: KernelSelection | None = None,
 ) -> torch.Tensor:
     if fuse_projections:
-        gate, up = _fused_linear_pair(x, mlp.gate_proj, mlp.up_proj)
+        gate, up = _fused_linear_pair(x, mlp.gate_proj, mlp.up_proj, kernels=kernels)
     else:
         # The eager reference keeps the two native GEMM shapes.  Besides matching
         # LeRobot's eager path, this preserves its rounding on selectively cast
         # (e.g. bf16) checkpoints.
         gate, up = mlp.gate_proj(x), mlp.up_proj(x)
     activated = _op(kernels, "gated_gelu", use_triton)(gate, up)
-    return mlp.down_proj(activated)
+    if type(mlp.down_proj) is nn.Linear:
+        return _op(kernels, "linear", False)(activated, mlp.down_proj.weight, mlp.down_proj.bias)
+    else:
+        return mlp.down_proj(activated)
 
 
 @dataclass
@@ -534,14 +576,39 @@ class Pi05Policy(FlowVLAPolicy):
             x = layer.layer_norm1(h)
             a = layer.self_attn
             b, s, _ = x.shape
-            q, k, v = [
-                proj(x).view(b, s, a.num_heads, a.head_dim).transpose(1, 2)
-                for proj in (a.q_proj, a.k_proj, a.v_proj)
-            ]
+            qkv = []
+            for proj in (a.q_proj, a.k_proj, a.v_proj):
+                if type(proj) is nn.Linear:
+                    projected = _op(self._kernels, "linear", False)(x, proj.weight, proj.bias)
+                else:
+                    projected = proj(x)
+                qkv.append(projected.view(b, s, a.num_heads, a.head_dim).transpose(1, 2))
+            q, k, v = qkv
             y = self._vision_attn.attend(q, k, v, scaling=a.scale)
-            h = h + a.out_proj(y.transpose(1, 2).reshape(b, s, -1).contiguous())
+            if type(a.out_proj) is nn.Linear:
+                h = h + _op(self._kernels, "linear", False)(
+                    y.transpose(1, 2).reshape(b, s, -1).contiguous(),
+                    a.out_proj.weight,
+                    a.out_proj.bias,
+                )
+            else:
+                h = h + a.out_proj(y.transpose(1, 2).reshape(b, s, -1).contiguous())
             x = layer.layer_norm2(h)
-            h = h + layer.mlp.fc2(layer.mlp.activation_fn(layer.mlp.fc1(x)))
+            if type(layer.mlp.fc1) is nn.Linear:
+                activated = _op(self._kernels, "linear", False)(x, layer.mlp.fc1.weight, layer.mlp.fc1.bias)
+            else:
+                activated = layer.mlp.fc1(x)
+            activation_fn = layer.mlp.activation_fn
+            if _is_gelu_tanh(activation_fn):
+                activated = _op(self._kernels, "gelu_tanh", False)(activated)
+            else:
+                activated = activation_fn(activated)
+            if type(layer.mlp.fc2) is nn.Linear:
+                h = h + _op(self._kernels, "linear", False)(
+                    activated, layer.mlp.fc2.weight, layer.mlp.fc2.bias
+                )
+            else:
+                h = h + layer.mlp.fc2(activated)
         h = vision.post_layernorm(h)
         h = pg.multi_modal_projector.linear(h)
         # Preserve both operations in LeRobot's embedding path: eliminating

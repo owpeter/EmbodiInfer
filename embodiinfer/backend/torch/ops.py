@@ -12,6 +12,18 @@ import torch
 from torch.nn import functional as F
 
 
+def linear(x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor | None = None) -> torch.Tensor:
+    """Apply the native Torch affine projection without mutating any input.
+
+    ``x`` is ``[..., in_features]``, ``weight`` is ``[out_features, in_features]``,
+    and optional ``bias`` is ``[out_features]``. The result is
+    ``[..., out_features]`` and retains ``x.dtype`` for same-dtype operands
+    outside autocast. Preserve the exact ``F.linear`` path, operand layouts,
+    bias handling, and autograd semantics; do not cast or reshape operands.
+    """
+    return F.linear(x, weight, bias)
+
+
 def gated_residual(residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
     """Return ``residual + update * gate``."""
     return residual + update * gate
@@ -35,6 +47,16 @@ def ada_rms_norm(x: torch.Tensor, modulation: torch.Tensor, eps: float) -> tuple
 def gated_gelu(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
     """Return tanh-approximate ``GELU(gate) * up``."""
     return F.gelu(gate, approximate="tanh") * up
+
+
+def gelu_tanh(x: torch.Tensor) -> torch.Tensor:
+    """Return exactly ``F.gelu(x, approximate="tanh")`` without mutating ``x``.
+
+    The floating tensor result retains the input's shape, dtype, and device.
+    Preserve native GELU rounding and autograd, including for noncontiguous
+    inputs; do not cast, reshape, or expand the formula into separate operations.
+    """
+    return F.gelu(x, approximate="tanh")
 
 
 def _rotate_half(x: torch.Tensor) -> torch.Tensor:
